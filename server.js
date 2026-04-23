@@ -10,35 +10,35 @@ const PORT = process.env.PORT || 3000;
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// 🔥 128K TARGET
-const MAX_CONTEXT = 128000;
-const SAFETY_BUFFER = 8000; // reserve for output + system overhead
-
-const MIN_OUTPUT = 512;
-const MAX_OUTPUT = 8192;
+// Realistic safe limits for Render + Janitor
+const MAX_CONTEXT_TOKENS = 128000;   // safe usable range
+const MIN_OUTPUT_TOKENS = 512;
+const MAX_OUTPUT_TOKENS = 4096;
 
 // ===== MIDDLEWARE =====
 app.use(cors());
 app.use(compression());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ limit: '20mb', extended: true }));
 
-// ===== MODEL MAP (force large-context models) =====
+// ===== MODEL MAP =====
 const MODEL_MAPPING = {
-  'gpt-4o': 'deepseek-ai/deepseek-v3.1',
+  'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
+  'gpt-4': 'qwen/qwen3-coder-480b-a35b-instruct',
   'gpt-4-turbo': 'moonshotai/kimi-k2-instruct-0905',
-  'gpt-4': 'qwen/qwen3-coder-480b-a35b-instruct'
+  'gpt-4o': 'deepseek-ai/deepseek-v3.1',
+  'claude-3-opus': 'openai/gpt-oss-120b',
+  'claude-3-sonnet': 'openai/gpt-oss-20b',
+  'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking'
 };
 
-// ===== TOKEN ESTIMATION =====
+// ===== UTIL: Rough token estimate =====
 function estimateTokens(obj) {
   return Math.floor(JSON.stringify(obj).length / 4);
 }
 
-// ===== HARD TRIM (128K SAFE) =====
-function trimMessages(messages) {
-  const maxInputTokens = MAX_CONTEXT - SAFETY_BUFFER;
-
+// ===== UTIL: Trim messages safely =====
+function trimMessages(messages, maxTokens = MAX_CONTEXT_TOKENS) {
   let total = 0;
   const trimmed = [];
 
@@ -46,7 +46,7 @@ function trimMessages(messages) {
     const msg = messages[i];
     const size = estimateTokens(msg);
 
-    if (total + size > maxInputTokens) break;
+    if (total + size > maxTokens) break;
 
     trimmed.unshift(msg);
     total += size;
@@ -55,15 +55,15 @@ function trimMessages(messages) {
   return trimmed;
 }
 
-// ===== DYNAMIC OUTPUT =====
+// ===== UTIL: Dynamic output tokens =====
 function calculateMaxTokens(messages) {
   const inputTokens = estimateTokens(messages);
 
-  const remaining = MAX_CONTEXT - inputTokens;
+  const remaining = MAX_CONTEXT_TOKENS - inputTokens;
 
   return Math.max(
-    MIN_OUTPUT,
-    Math.min(MAX_OUTPUT, remaining - 1000)
+    MIN_OUTPUT_TOKENS,
+    Math.min(MAX_OUTPUT_TOKENS, remaining)
   );
 }
 
@@ -71,37 +71,42 @@ function calculateMaxTokens(messages) {
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    mode: '128k-attempt',
-    max_context: MAX_CONTEXT
+    max_context: MAX_CONTEXT_TOKENS
   });
 });
 
-// ===== MAIN =====
+// ===== MODELS =====
+app.get('/v1/models', (req, res) => {
+  const models = Object.keys(MODEL_MAPPING).map(model => ({
+    id: model,
+    object: 'model',
+    created: Date.now(),
+    owned_by: 'nim-proxy'
+  }));
+
+  res.json({ object: 'list', data: models });
+});
+
+// ===== MAIN ENDPOINT =====
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
 
-    const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v3.1';
+    // ===== MODEL RESOLVE =====
+    let nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v3.1';
 
-    // 🔥 TRIM FOR 128K
+    // ===== TRIM CONTEXT =====
     const safeMessages = trimMessages(messages);
 
-    const inputTokens = estimateTokens(safeMessages);
+    // ===== TOKEN CONTROL =====
     const safeMaxTokens = max_tokens || calculateMaxTokens(safeMessages);
 
-    // ===== DEBUG =====
-    console.log("RAW size:", JSON.stringify(messages).length);
-    console.log("INPUT tokens:", inputTokens);
-    console.log("OUTPUT tokens:", safeMaxTokens);
-    console.log("TOTAL:", inputTokens + safeMaxTokens);
+    // ===== DEBUG LOG =====
+    console.log("Incoming size:", JSON.stringify(messages).length);
+    console.log("Trimmed tokens:", estimateTokens(safeMessages));
+    console.log("Max output:", safeMaxTokens);
 
-    // 🚨 HARD FAIL GUARD
-    if (inputTokens + safeMaxTokens > MAX_CONTEXT) {
-      return res.status(400).json({
-        error: "Context overflow even after trimming"
-      });
-    }
-
+    // ===== REQUEST =====
     const nimRequest = {
       model: nimModel,
       messages: safeMessages,
@@ -120,37 +125,67 @@ app.post('/v1/chat/completions', async (req, res) => {
         },
         maxBodyLength: Infinity,
         maxContentLength: Infinity,
-        timeout: 60000,
         responseType: stream ? 'stream' : 'json'
       }
     );
 
+    // ===== STREAM =====
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
-      response.data.on('data', chunk => res.write(chunk.toString()));
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+
+      response.data.on('data', chunk => {
+        res.write(chunk.toString());
+      });
+
       response.data.on('end', () => res.end());
+      response.data.on('error', () => res.end());
       return;
     }
 
-    res.json({
+    // ===== NORMAL RESPONSE =====
+    const openaiResponse = {
       id: `chatcmpl-${Date.now()}`,
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
-      model,
-      choices: response.data.choices,
+      model: model,
+      choices: response.data.choices.map(choice => ({
+        index: choice.index,
+        message: {
+          role: choice.message.role,
+          content: choice.message.content
+        },
+        finish_reason: choice.finish_reason
+      })),
       usage: response.data.usage || {}
-    });
+    };
+
+    res.json(openaiResponse);
 
   } catch (error) {
     console.error("ERROR:", error.response?.data || error.message);
 
     res.status(error.response?.status || 500).json({
-      error: error.response?.data || error.message
+      error: {
+        message: error.response?.data || error.message,
+        code: error.response?.status || 500
+      }
     });
   }
 });
 
+// ===== FALLBACK =====
+app.use((req, res) => {
+  res.status(404).json({
+    error: {
+      message: "Endpoint not found",
+      code: 404
+    }
+  });
+});
+
 // ===== START =====
 app.listen(PORT, () => {
-  console.log(`🔥 128K proxy running on ${PORT}`);
+  console.log(`Proxy running on port ${PORT}`);
 });
