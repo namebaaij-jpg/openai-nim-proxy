@@ -6,18 +6,20 @@ const compression = require('compression');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ===== CONFIG =====
 const NIM_API_BASE = 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
+// ===== MIDDLEWARE =====
 app.use(cors());
 app.use(compression());
 app.use(express.json({ limit: '50mb' }));
 
-// ===== MODEL PRIORITY LIST =====
+// ===== MODELS (GLM FIRST, SAFE FALLBACKS) =====
 const MODELS = [
-  'z-ai/glm-5.1',                         // TRY FIRST (may 410)
-  'deepseek-ai/deepseek-v3.1',           // SAFE
-  'qwen/qwen3-coder-480b-a35b-instruct'  // SAFE
+  'z-ai/glm-5.1', // ⚠️ unstable / may 410
+  'zai-org/GLM-4.7',
+  'qwen/qwen3-coder-480b-a35b-instruct'
 ];
 
 // ===== HEALTH =====
@@ -44,7 +46,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     let lastError = null;
 
-    // ===== TRY MODELS IN ORDER =====
+    // ===== TRY MODELS ONE BY ONE =====
     for (const model of MODELS) {
       try {
         console.log("Trying model:", model);
@@ -63,7 +65,7 @@ app.post('/v1/chat/completions', async (req, res) => {
               Authorization: `Bearer ${NIM_API_KEY}`,
               'Content-Type': 'application/json'
             },
-            timeout: 60000
+            timeout: 30000 // 🔥 prevents “no response” hangs
           }
         );
 
@@ -71,6 +73,11 @@ app.post('/v1/chat/completions', async (req, res) => {
           response.data?.choices?.[0]?.message?.content ||
           response.data?.choices?.[0]?.text ||
           "";
+
+        // 🚨 protect against empty responses
+        if (!content || content.trim().length === 0) {
+          throw new Error("Empty response from model");
+        }
 
         return res.json({
           id: `chatcmpl-${Date.now()}`,
@@ -90,17 +97,17 @@ app.post('/v1/chat/completions', async (req, res) => {
         });
 
       } catch (err) {
-        console.log(`Model failed: ${model}`, err.response?.status || err.message);
+        console.log(`❌ Failed model: ${model}`, err.response?.status || err.message);
         lastError = err;
-        continue;
+        continue; // try next model
       }
     }
 
-    // ===== ALL FAILED =====
+    // ===== ALL MODELS FAILED =====
     return res.status(500).json({
       error: {
         message: "All models failed",
-        detail: lastError?.message || "Unknown error"
+        detail: lastError?.message || "No valid response from NIM"
       }
     });
 
@@ -116,10 +123,12 @@ app.post('/v1/chat/completions', async (req, res) => {
 
 // ===== 404 =====
 app.use((req, res) => {
-  res.status(404).json({ error: "Not found" });
+  res.status(404).json({
+    error: "Not found"
+  });
 });
 
 // ===== START =====
 app.listen(PORT, () => {
-  console.log(`🔥 GLM-5.1 fallback proxy running on port ${PORT}`);
+  console.log(`🔥 Stable Janitor Proxy running on port ${PORT}`);
 });
