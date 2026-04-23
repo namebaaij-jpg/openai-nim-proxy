@@ -10,35 +10,34 @@ const PORT = process.env.PORT || 3000;
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// Realistic safe limits for Render + Janitor
-const MAX_CONTEXT_TOKENS = 128000;   // safe usable range
-const MIN_OUTPUT_TOKENS = 512;
-const MAX_OUTPUT_TOKENS = 4096;
+// 🔥 128K SETTINGS
+const MAX_CONTEXT = 128000;
+const SAFETY_BUFFER = 10000; // protects from overflow
+const MIN_OUTPUT = 512;
+const MAX_OUTPUT = 8192;
 
 // ===== MIDDLEWARE =====
 app.use(cors());
 app.use(compression());
-app.use(express.json({ limit: '20mb' }));
-app.use(express.urlencoded({ limit: '20mb', extended: true }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // ===== MODEL MAP =====
 const MODEL_MAPPING = {
-  'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
-  'gpt-4': 'qwen/qwen3-coder-480b-a35b-instruct',
-  'gpt-4-turbo': 'moonshotai/kimi-k2-instruct-0905',
   'gpt-4o': 'deepseek-ai/deepseek-v3.1',
-  'claude-3-opus': 'openai/gpt-oss-120b',
-  'claude-3-sonnet': 'openai/gpt-oss-20b',
-  'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking'
+  'gpt-4-turbo': 'moonshotai/kimi-k2-instruct-0905',
+  'gpt-4': 'qwen/qwen3-coder-480b-a35b-instruct'
 };
 
-// ===== UTIL: Rough token estimate =====
+// ===== TOKEN ESTIMATION =====
 function estimateTokens(obj) {
   return Math.floor(JSON.stringify(obj).length / 4);
 }
 
-// ===== UTIL: Trim messages safely =====
-function trimMessages(messages, maxTokens = MAX_CONTEXT_TOKENS) {
+// ===== TRIM LOGIC =====
+function trimMessages(messages) {
+  const maxInput = MAX_CONTEXT - SAFETY_BUFFER;
+
   let total = 0;
   const trimmed = [];
 
@@ -46,7 +45,7 @@ function trimMessages(messages, maxTokens = MAX_CONTEXT_TOKENS) {
     const msg = messages[i];
     const size = estimateTokens(msg);
 
-    if (total + size > maxTokens) break;
+    if (total + size > maxInput) break;
 
     trimmed.unshift(msg);
     total += size;
@@ -55,15 +54,14 @@ function trimMessages(messages, maxTokens = MAX_CONTEXT_TOKENS) {
   return trimmed;
 }
 
-// ===== UTIL: Dynamic output tokens =====
+// ===== OUTPUT CONTROL =====
 function calculateMaxTokens(messages) {
-  const inputTokens = estimateTokens(messages);
-
-  const remaining = MAX_CONTEXT_TOKENS - inputTokens;
+  const input = estimateTokens(messages);
+  const remaining = MAX_CONTEXT - input;
 
   return Math.max(
-    MIN_OUTPUT_TOKENS,
-    Math.min(MAX_OUTPUT_TOKENS, remaining)
+    MIN_OUTPUT,
+    Math.min(MAX_OUTPUT, remaining - 1000)
   );
 }
 
@@ -71,20 +69,9 @@ function calculateMaxTokens(messages) {
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    max_context: MAX_CONTEXT_TOKENS
+    mode: '128k',
+    max_context: MAX_CONTEXT
   });
-});
-
-// ===== MODELS =====
-app.get('/v1/models', (req, res) => {
-  const models = Object.keys(MODEL_MAPPING).map(model => ({
-    id: model,
-    object: 'model',
-    created: Date.now(),
-    owned_by: 'nim-proxy'
-  }));
-
-  res.json({ object: 'list', data: models });
 });
 
 // ===== MAIN ENDPOINT =====
@@ -92,32 +79,35 @@ app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
 
-    // ===== MODEL RESOLVE =====
-    let nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v3.1';
+    const nimModel = MODEL_MAPPING[model] || 'deepseek-ai/deepseek-v3.1';
 
-    // ===== TRIM CONTEXT =====
+    // 🔥 TRIM TO SAFE RANGE
     const safeMessages = trimMessages(messages);
 
-    // ===== TOKEN CONTROL =====
+    const inputTokens = estimateTokens(safeMessages);
     const safeMaxTokens = max_tokens || calculateMaxTokens(safeMessages);
 
-    // ===== DEBUG LOG =====
-    console.log("Incoming size:", JSON.stringify(messages).length);
-    console.log("Trimmed tokens:", estimateTokens(safeMessages));
-    console.log("Max output:", safeMaxTokens);
+    console.log("RAW SIZE:", JSON.stringify(messages).length);
+    console.log("INPUT TOKENS:", inputTokens);
+    console.log("OUTPUT TOKENS:", safeMaxTokens);
+    console.log("TOTAL:", inputTokens + safeMaxTokens);
 
-    // ===== REQUEST =====
-    const nimRequest = {
-      model: nimModel,
-      messages: safeMessages,
-      temperature: temperature || 0.7,
-      max_tokens: safeMaxTokens,
-      stream: stream || false
-    };
+    // 🚨 HARD GUARD
+    if (inputTokens + safeMaxTokens > MAX_CONTEXT) {
+      return res.status(400).json({
+        error: "Context overflow prevented"
+      });
+    }
 
     const response = await axios.post(
       `${NIM_API_BASE}/chat/completions`,
-      nimRequest,
+      {
+        model: nimModel,
+        messages: safeMessages,
+        temperature: temperature || 0.7,
+        max_tokens: safeMaxTokens,
+        stream: stream || false
+      },
       {
         headers: {
           'Authorization': `Bearer ${NIM_API_KEY}`,
@@ -125,52 +115,32 @@ app.post('/v1/chat/completions', async (req, res) => {
         },
         maxBodyLength: Infinity,
         maxContentLength: Infinity,
+        timeout: 60000,
         responseType: stream ? 'stream' : 'json'
       }
     );
 
-    // ===== STREAM =====
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-
-      response.data.on('data', chunk => {
-        res.write(chunk.toString());
-      });
-
+      response.data.on('data', chunk => res.write(chunk.toString()));
       response.data.on('end', () => res.end());
-      response.data.on('error', () => res.end());
       return;
     }
 
-    // ===== NORMAL RESPONSE =====
-    const openaiResponse = {
+    res.json({
       id: `chatcmpl-${Date.now()}`,
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
-      model: model,
-      choices: response.data.choices.map(choice => ({
-        index: choice.index,
-        message: {
-          role: choice.message.role,
-          content: choice.message.content
-        },
-        finish_reason: choice.finish_reason
-      })),
+      model,
+      choices: response.data.choices,
       usage: response.data.usage || {}
-    };
-
-    res.json(openaiResponse);
+    });
 
   } catch (error) {
     console.error("ERROR:", error.response?.data || error.message);
 
     res.status(error.response?.status || 500).json({
-      error: {
-        message: error.response?.data || error.message,
-        code: error.response?.status || 500
-      }
+      error: error.response?.data || error.message
     });
   }
 });
@@ -178,14 +148,11 @@ app.post('/v1/chat/completions', async (req, res) => {
 // ===== FALLBACK =====
 app.use((req, res) => {
   res.status(404).json({
-    error: {
-      message: "Endpoint not found",
-      code: 404
-    }
+    error: "Endpoint not found"
   });
 });
 
 // ===== START =====
 app.listen(PORT, () => {
-  console.log(`Proxy running on port ${PORT}`);
+  console.log(`🔥 128K Proxy running on port ${PORT}`);
 });
