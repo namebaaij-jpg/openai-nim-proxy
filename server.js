@@ -15,11 +15,11 @@ app.use(cors());
 app.use(compression());
 app.use(express.json({ limit: '50mb' }));
 
-// ===== MODELS (GLM FIRST, SAFE FALLBACKS) =====
+// ===== FAST + STABLE MODELS ONLY =====
 const MODELS = [
-  'z-ai/glm-5.1', // ⚠️ unstable / may 410
-  'zai-org/GLM-4.7',
+  'deepseek-ai/deepseek-v3.1',
   'qwen/qwen3-coder-480b-a35b-instruct'
+  // ⚠️ GLM REMOVED intentionally (it was causing hangs/410/timeout)
 ];
 
 // ===== HEALTH =====
@@ -38,84 +38,68 @@ app.post('/v1/chat/completions', async (req, res) => {
     if (!Array.isArray(messages)) {
       return res.status(400).json({
         error: {
-          message: "Invalid messages format",
-          type: "invalid_request_error"
+          message: "Invalid messages format"
         }
       });
     }
 
-    let lastError = null;
-
-    // ===== TRY MODELS ONE BY ONE =====
-    for (const model of MODELS) {
-      try {
-        console.log("Trying model:", model);
-
-        const response = await axios.post(
-          `${NIM_API_BASE}/chat/completions`,
-          {
-            model,
-            messages,
-            temperature: temperature || 0.7,
-            max_tokens: max_tokens || 4096,
-            stream: false
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${NIM_API_KEY}`,
-              'Content-Type': 'application/json'
-            },
-            timeout: 30000 // 🔥 prevents “no response” hangs
-          }
-        );
-
-        const content =
-          response.data?.choices?.[0]?.message?.content ||
-          response.data?.choices?.[0]?.text ||
-          "";
-
-        // 🚨 protect against empty responses
-        if (!content || content.trim().length === 0) {
-          throw new Error("Empty response from model");
-        }
-
-        return res.json({
-          id: `chatcmpl-${Date.now()}`,
-          object: "chat.completion",
-          created: Math.floor(Date.now() / 1000),
+    // ===== RUN MODELS IN PARALLEL (🔥 FIXES TIMEOUT ISSUE) =====
+    const requests = MODELS.map(model =>
+      axios.post(
+        `${NIM_API_BASE}/chat/completions`,
+        {
           model,
-          choices: [
-            {
-              index: 0,
-              message: {
-                role: "assistant",
-                content
-              },
-              finish_reason: "stop"
-            }
-          ]
-        });
+          messages,
+          temperature: temperature || 0.7,
+          max_tokens: max_tokens || 4096,
+          stream: false
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${NIM_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 15000 // fast fail
+        }
+      ).then(res => ({
+        model,
+        content: res.data?.choices?.[0]?.message?.content
+      })).catch(() => null)
+    );
 
-      } catch (err) {
-        console.log(`❌ Failed model: ${model}`, err.response?.status || err.message);
-        lastError = err;
-        continue; // try next model
-      }
+    // ===== WAIT FOR FIRST SUCCESS ONLY =====
+    const results = await Promise.all(requests);
+    const success = results.find(r => r && r.content);
+
+    if (!success) {
+      return res.status(500).json({
+        error: {
+          message: "No models responded"
+        }
+      });
     }
 
-    // ===== ALL MODELS FAILED =====
-    return res.status(500).json({
-      error: {
-        message: "All models failed",
-        detail: lastError?.message || "No valid response from NIM"
-      }
+    return res.json({
+      id: `chatcmpl-${Date.now()}`,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: success.model,
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: success.content
+          },
+          finish_reason: "stop"
+        }
+      ]
     });
 
   } catch (err) {
     return res.status(500).json({
       error: {
-        message: err.message,
-        type: "proxy_error"
+        message: err.message
       }
     });
   }
@@ -123,9 +107,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
 // ===== 404 =====
 app.use((req, res) => {
-  res.status(404).json({
-    error: "Not found"
-  });
+  res.status(404).json({ error: "Not found" });
 });
 
 // ===== START =====
