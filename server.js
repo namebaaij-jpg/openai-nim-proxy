@@ -28,7 +28,7 @@ const MODELS = {
   "deepseek-ai/deepseek-v4-pro": "deepseek-ai/deepseek-v4-pro"
 };
 
-const MODEL = "z-ai/glm-5.1"; // Default model
+const MODEL = "deepseek-ai/deepseek-v4-flash"; // ✅ Default model updated
 
 // ===== HEALTH CHECK =====
 app.get('/', (req, res) => {
@@ -89,7 +89,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           Authorization: `Bearer ${NIM_API_KEY}`,
           'Content-Type': 'application/json'
         },
-        timeout: 120000 // ✅ 2 minute timeout
+        timeout: 120000
       }
     );
 
