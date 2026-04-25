@@ -28,7 +28,44 @@ const MODELS = {
   "deepseek-ai/deepseek-v4-pro": "deepseek-ai/deepseek-v4-pro"
 };
 
-const MODEL = "deepseek-ai/deepseek-v4-flash"; // ✅ Default model updated
+const MODEL = "deepseek-ai/deepseek-v4-pro"; // ✅ Default model updated to Pro
+
+// ✅ Rough token estimator (1 token ≈ 4 chars)
+function estimateTokens(text) {
+  return Math.ceil((text || '').length / 4);
+}
+
+// ✅ Trim messages to fit within token budget
+function trimMessages(messages, maxTokens = 3000) {
+  const system = messages.filter(m => m.role === 'system');
+  const nonSystem = messages.filter(m => m.role !== 'system');
+
+  // Trim system prompt if too long
+  let systemMsg = system[0] || null;
+  if (systemMsg && estimateTokens(systemMsg.content) > 1500) {
+    console.log("⚠️ System prompt too long, trimming...");
+    systemMsg = {
+      ...systemMsg,
+      content: systemMsg.content.substring(0, 6000) // Cap at ~1500 tokens
+    };
+  }
+
+  // Keep last 20 chat messages
+  const recentMessages = nonSystem.slice(-20);
+
+  // Calculate total tokens used
+  let totalTokens = systemMsg ? estimateTokens(systemMsg.content) : 0;
+  const finalMessages = [];
+
+  for (const msg of recentMessages) {
+    const tokens = estimateTokens(msg.content);
+    if (totalTokens + tokens > maxTokens) break;
+    finalMessages.push(msg);
+    totalTokens += tokens;
+  }
+
+  return systemMsg ? [systemMsg, ...finalMessages] : finalMessages;
+}
 
 // ===== HEALTH CHECK =====
 app.get('/', (req, res) => {
@@ -70,10 +107,11 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     const selectedModel = MODELS[model] || MODEL;
 
-    // ✅ Trim to last 20 messages to avoid context overflow
-    const trimmedMessages = messages.slice(-20);
+    // ✅ Trim system prompt + messages to fit token budget
+    const trimmedMessages = trimMessages(messages, 3000);
 
     console.log("📤 Sending to NIM:", selectedModel, "Messages:", trimmedMessages.length);
+    console.log("📊 Estimated tokens:", trimmedMessages.reduce((acc, m) => acc + estimateTokens(m.content), 0));
 
     const response = await axios.post(
       `${NIM_API_BASE}/chat/completions`,
