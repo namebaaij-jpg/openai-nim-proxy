@@ -21,7 +21,7 @@ const NIM_API_BASE = 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
 // ✅ FIXED: Valid NVIDIA NIM model ID
-const MODEL = "zhipuai/glm-4-9b-chat";
+const MODEL = "z-ai/glm-5.1";
 
 // ===== HEALTH CHECK =====
 app.get('/', (req, res) => {
