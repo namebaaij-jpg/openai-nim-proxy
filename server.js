@@ -15,7 +15,7 @@ app.use(cors({
 app.options('*', cors());
 
 // Body parser
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '100mb' }));
 
 // NVIDIA config
 const NIM_API_BASE = 'https://integrate.api.nvidia.com/v1';
