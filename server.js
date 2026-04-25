@@ -22,7 +22,7 @@ const NIM_API_BASE = 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
 // 🔥 FORCE MODEL (NO MAPPING)
-const MODEL = "z-ai/glm5.1";
+const MODEL = "z-ai/glm-5.1";
 
 // ===== HEALTH CHECK =====
 app.get('/', (req, res) => {
