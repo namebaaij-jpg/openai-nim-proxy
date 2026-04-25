@@ -20,40 +20,61 @@ app.use(express.json({ limit: '100mb' }));
 const NIM_API_BASE = 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// ✅ FIXED: Valid NVIDIA NIM model ID
-const MODEL = "z-ai/glm-5.1";
+// ✅ All available models
+const MODELS = {
+  "z-ai/glm-5.1": "z-ai/glm-5.1",
+  "z-ai/glm-4.7": "z-ai/glm-4.7",
+  "deepseek-ai/deepseek-v4-flash": "deepseek-ai/deepseek-v4-flash",
+  "deepseek-ai/deepseek-v4-pro": "deepseek-ai/deepseek-v4-pro"
+};
+
+const MODEL = "z-ai/glm-5.1"; // Default model
 
 // ===== HEALTH CHECK =====
 app.get('/', (req, res) => {
   res.send('✅ Proxy is running');
 });
 
-// ===== MODELS =====
+// ===== DEBUG: LIST AVAILABLE NVIDIA MODELS =====
+app.get('/debug/models', async (req, res) => {
+  try {
+    const response = await axios.get(`${NIM_API_BASE}/models`, {
+      headers: {
+        Authorization: `Bearer ${NIM_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    res.json(response.data);
+  } catch (error) {
+    res.status(500).json({ error: error.response?.data || error.message });
+  }
+});
+
+// ===== MODELS (REQUIRED FOR JANITOR) =====
 app.get('/v1/models', (req, res) => {
   res.json({
     object: 'list',
-    data: [
-      {
-        id: MODEL,
-        object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: 'nvidia'
-      }
-    ]
+    data: Object.keys(MODELS).map(id => ({
+      id: id,
+      object: 'model',
+      created: Math.floor(Date.now() / 1000),
+      owned_by: 'nvidia'
+    }))
   });
 });
 
 // ===== CHAT =====
-// ✅ FIXED: app.post was corrupted to [app.post](http://app.post)
 app.post('/v1/chat/completions', async (req, res) => {
   try {
-    const { messages, temperature, max_tokens } = req.body;
+    const { messages, temperature, max_tokens, model } = req.body;
 
-    // ✅ FIXED: axios.post was corrupted to [axios.post](http://axios.post)
+    // ✅ Use model from request if valid, otherwise fall back to default
+    const selectedModel = MODELS[model] || MODEL;
+
     const response = await axios.post(
       `${NIM_API_BASE}/chat/completions`,
       {
-        model: MODEL,
+        model: selectedModel,
         messages: messages,
         temperature: temperature || 0.8,
         max_tokens: Math.min(max_tokens || 1024, 8192),
@@ -68,15 +89,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
     );
 
-    // ✅ FIXED: response.data was corrupted to [response.data](http://response.data)
     const choice = response.data?.choices?.[0];
 
     res.json({
-      // ✅ FIXED: Date.now was corrupted to [Date.now](http://Date.now)
       id: `chatcmpl-${Date.now()}`,
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
-      model: MODEL,
+      model: selectedModel,
       choices: [
         {
           index: 0,
@@ -87,7 +106,6 @@ app.post('/v1/chat/completions', async (req, res) => {
           finish_reason: choice?.finish_reason || 'stop'
         }
       ],
-      // ✅ ADDED: usage block expected by many frontends
       usage: response.data?.usage || {
         prompt_tokens: 0,
         completion_tokens: 0,
@@ -111,7 +129,7 @@ app.all('*', (req, res) => {
   res.status(404).json({ error: { message: 'Not found' } });
 });
 
-// START SERVER
+// ===== START SERVER =====
 app.listen(PORT, () => {
   console.log(`🔥 Proxy running on port ${PORT}`);
 });
