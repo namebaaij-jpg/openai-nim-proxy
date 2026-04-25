@@ -68,16 +68,20 @@ app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { messages, temperature, max_tokens, model } = req.body;
 
-    // ✅ Use model from request if valid, otherwise fall back to default
     const selectedModel = MODELS[model] || MODEL;
+
+    // ✅ Trim to last 20 messages to avoid context overflow
+    const trimmedMessages = messages.slice(-20);
+
+    console.log("📤 Sending to NIM:", selectedModel, "Messages:", trimmedMessages.length);
 
     const response = await axios.post(
       `${NIM_API_BASE}/chat/completions`,
       {
         model: selectedModel,
-        messages: messages,
+        messages: trimmedMessages,
         temperature: temperature || 0.8,
-        max_tokens: Math.min(max_tokens || 1024, 8192),
+        max_tokens: Math.min(max_tokens || 1024, 4096),
         stream: false
       },
       {
@@ -85,11 +89,22 @@ app.post('/v1/chat/completions', async (req, res) => {
           Authorization: `Bearer ${NIM_API_KEY}`,
           'Content-Type': 'application/json'
         },
-        timeout: 60000
+        timeout: 120000 // ✅ 2 minute timeout
       }
     );
 
     const choice = response.data?.choices?.[0];
+    const content = choice?.message?.content;
+
+    // ✅ Catch empty responses before sending to Janitor
+    if (!content || content.trim() === '') {
+      return res.status(500).json({
+        error: {
+          message: 'Model returned empty response',
+          type: 'empty_response'
+        }
+      });
+    }
 
     res.json({
       id: `chatcmpl-${Date.now()}`,
@@ -101,7 +116,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           index: 0,
           message: {
             role: 'assistant',
-            content: choice?.message?.content || ''
+            content: content
           },
           finish_reason: choice?.finish_reason || 'stop'
         }
